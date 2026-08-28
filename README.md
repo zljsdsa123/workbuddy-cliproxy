@@ -10,7 +10,7 @@
 
 ## 模型
 
-`glm-5.2` · `glm-5.1` · `glm-5v-turbo` · `kimi-k2.7` · `minimax-m3-pay` · `hy3` · `hy3-preview` · `hy3-preview-agent` · `deepseek-v4-pro` · `deepseek-v4-flash`
+`hy4-preview` · `hy3` · `glm-5.3-flash` · `deepseek-v4-flash`
 
 具体可用性以 CodeBuddy 账号权限为准。
 
