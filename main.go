@@ -61,10 +61,12 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -86,8 +88,27 @@ const (
 	endpointAuthToken    = upstreamBase + "/v2/plugin/auth/token?state="
 	endpointTokenRefresh = upstreamBase + "/v2/plugin/auth/token/refresh"
 	endpointChat         = upstreamBase + "/v2/chat/completions"
+	endpointUserResource = upstreamBase + "/v2/billing/meter/get-user-resource"
 
 	loginTTL = 5 * time.Minute
+
+	// quotaProductCode scopes the billing query to CodeBuddy resource packages.
+	quotaProductCode = "p_tcaca"
+	// quotaCooldown is how long a credential stays locally exhausted once its
+	// credits run out. CodeBuddy exposes no reset timestamp (packages are
+	// recharged manually), so we re-probe the balance on this cadence instead of
+	// waiting for a provider-declared recovery time.
+	quotaCooldown = 30 * time.Minute
+	// quotaBalanceTTL bounds how long a successful balance reading is trusted
+	// before the next upstream call re-probes it.
+	quotaBalanceTTL = 10 * time.Minute
+	// quotaProbeTimeout bounds the billing API call so a slow balance probe
+	// cannot stall the chat request that triggered it.
+	quotaProbeTimeout = 10 * time.Second
+	// quotaExhaustedStatus is the HTTP status reported to CPA when credits are
+	// exhausted. 429 is what drives quota cooldown + credential rotation in
+	// the host's MarkResult handling.
+	quotaExhaustedStatus = http.StatusTooManyRequests
 )
 
 // loginCtx holds the cookie-affined HTTP client for one in-flight login flow.
@@ -140,7 +161,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	raw, errHandle := handleMethod(C.GoString(method), requestBytes)
 	if errHandle != nil {
-		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
+		writeResponse(response, errorEnvelopeFor(errHandle))
 		return 1
 	}
 	writeResponse(response, raw)
@@ -220,6 +241,20 @@ func streamClose(streamID string) {
 	_, _ = hostCall(pluginabi.MethodHostStreamClose, body)
 }
 
+// log forwards a structured message to the host logger. Best effort: a logging
+// failure must never affect request handling.
+func log(level, message string, fields map[string]any) {
+	payload := map[string]any{"level": level, "message": message}
+	if len(fields) > 0 {
+		payload["fields"] = fields
+	}
+	body, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return
+	}
+	_, _ = hostCall(pluginabi.MethodHostLog, body)
+}
+
 // -----------------------------------------------------------------------------
 // RPC dispatch
 // -----------------------------------------------------------------------------
@@ -261,9 +296,15 @@ type envelope struct {
 	Error  *envelopeError  `json:"error,omitempty"`
 }
 
+// envelopeError mirrors the host's pluginabi.Error. HTTPStatus is the only
+// channel the host uses to recover an upstream status code from a plugin
+// failure (see decodeEnvelopeResult in internal/pluginhost/rpc_client.go), and
+// that status is what drives quota cooldown and credential rotation.
 type envelopeError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	Retryable  bool   `json:"retryable,omitempty"`
+	HTTPStatus int    `json:"http_status,omitempty"`
 }
 
 type identifierResponse struct {
@@ -344,9 +385,15 @@ func wbModels() []pluginapi.ModelInfo {
 // -----------------------------------------------------------------------------
 
 // storedAuth is the on-disk shape of a workbuddy credential.
+//
+// Note is the human-readable credits summary surfaced on the management panel's
+// credential card. The host merges auth metadata back into this file, so the
+// field round-trips: it is written from metadata on save and read back here on
+// parse, which keeps the balance visible across restarts until the next probe.
 type storedAuth struct {
 	Auth    storedTokens  `json:"auth"`
 	Account storedAccount `json:"account"`
+	Note    string        `json:"note,omitempty"`
 }
 
 type storedTokens struct {
@@ -525,13 +572,17 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 
 func toAuthData(sa *storedAuth) pluginapi.AuthData {
 	storage, _ := json.Marshal(sa)
+	metadata := map[string]any{"type": providerName}
+	if note := strings.TrimSpace(sa.Note); note != "" {
+		metadata["note"] = note
+	}
 	return pluginapi.AuthData{
 		Provider:    providerName,
 		ID:          providerName,
 		FileName:    authFileName,
 		Label:       "WorkBuddy",
 		StorageJSON: storage,
-		Metadata:    map[string]any{"type": providerName},
+		Metadata:    metadata,
 	}
 }
 
@@ -618,6 +669,9 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 		},
 	}
 	loginStates.Delete(state)
+	// Seed the credits note so the credential card shows a balance right away
+	// instead of staying blank until the first refresh cycle.
+	refreshCreditsNote(sa, "")
 	return okEnvelope(pluginapi.AuthLoginPollResponse{
 		Status: pluginapi.AuthLoginStatusSuccess,
 		Auth:   toAuthData(sa),
@@ -644,7 +698,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	data, status, err := doJSON(sharedHTTPClient(), http.MethodPost, endpointTokenRefresh, headers, nil)
 	if err != nil {
 		if status >= 400 {
-			return nil, fmt.Errorf("refresh rejected (HTTP %d)", status)
+			return nil, newUpstreamError(status, "", fmt.Sprintf("refresh rejected (HTTP %d)", status))
 		}
 		return nil, fmt.Errorf("refresh: %w", err)
 	}
@@ -660,7 +714,464 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		sa.Auth.Domain = tok.Domain
 	}
 	sa.Auth.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+	// A token refresh is the natural place to re-read the balance: the refreshed
+	// credential is persisted anyway, so the note rides along at no extra cost.
+	refreshCreditsNote(sa, req.AuthID)
 	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthData(sa)})
+}
+
+// -----------------------------------------------------------------------------
+// Quota / credits tracking
+// -----------------------------------------------------------------------------
+
+// creditsState is the cached credits balance for one credential.
+//
+// CodeBuddy meters usage as prepaid "credits" packages rather than a rate limit,
+// and exposes no reset timestamp — packages are topped up manually. So instead of
+// waiting for a provider-declared recovery time, an exhausted credential is held
+// down locally for quotaCooldown and then re-probed.
+type creditsState struct {
+	remaining   float64
+	known       bool
+	checkedAt   time.Time
+	exhaustedAt time.Time // non-zero while the credential is locally cooled down
+	// estimated marks a balance that has been locally debited from per-request
+	// credit reports since the last authoritative billing reading.
+	estimated bool
+}
+
+// exhausted reports whether the credential is still inside its local cooldown.
+func (s creditsState) exhausted(now time.Time) bool {
+	return !s.exhaustedAt.IsZero() && now.Sub(s.exhaustedAt) < quotaCooldown
+}
+
+// stale reports whether the cached balance is too old to trust.
+func (s creditsState) stale(now time.Time) bool {
+	return !s.known || now.Sub(s.checkedAt) >= quotaBalanceTTL
+}
+
+var (
+	creditsByAuth  sync.Map // auth key(string) -> creditsState
+	creditsProbeMu sync.Map // auth key(string) -> *sync.Mutex, collapses concurrent probes
+)
+
+// creditsKey identifies the credential a credits reading belongs to. The
+// executor request's AuthID is authoritative; the account UID is the fallback
+// for paths that do not carry one (a single credential per CodeBuddy account).
+func creditsKey(authID string, sa *storedAuth) string {
+	if key := strings.TrimSpace(authID); key != "" {
+		return key
+	}
+	if sa != nil {
+		if uid := strings.TrimSpace(sa.Account.UID); uid != "" {
+			return "uid:" + uid
+		}
+	}
+	return ""
+}
+
+func loadCreditsState(key string) (creditsState, bool) {
+	if key == "" {
+		return creditsState{}, false
+	}
+	value, ok := creditsByAuth.Load(key)
+	if !ok {
+		return creditsState{}, false
+	}
+	state, ok := value.(creditsState)
+	if !ok {
+		creditsByAuth.Delete(key)
+		return creditsState{}, false
+	}
+	return state, true
+}
+
+// storeCreditsBalance records a fresh balance reading, entering or leaving the
+// local cooldown according to whether any credits remain.
+func storeCreditsBalance(key string, remaining float64, now time.Time) {
+	if key == "" {
+		return
+	}
+	state := creditsState{remaining: remaining, known: true, checkedAt: now}
+	if remaining <= 0 {
+		// Preserve the original exhaustion timestamp so repeated probes during a
+		// cooldown window do not keep extending it.
+		if prev, ok := loadCreditsState(key); ok && !prev.exhaustedAt.IsZero() {
+			state.exhaustedAt = prev.exhaustedAt
+		} else {
+			state.exhaustedAt = now
+		}
+	}
+	creditsByAuth.Store(key, state)
+}
+
+// markCreditsExhausted starts a local cooldown after the upstream reported a
+// quota failure, even when the balance API has not been consulted yet.
+func markCreditsExhausted(key string, now time.Time) {
+	if key == "" {
+		return
+	}
+	state, _ := loadCreditsState(key)
+	state.remaining = 0
+	state.known = true
+	state.checkedAt = now
+	// The upstream itself reported exhaustion, so zero is authoritative here.
+	state.estimated = false
+	if state.exhaustedAt.IsZero() {
+		state.exhaustedAt = now
+	}
+	creditsByAuth.Store(key, state)
+}
+
+func creditsProbeLock(key string) *sync.Mutex {
+	value, _ := creditsProbeMu.LoadOrStore(key, &sync.Mutex{})
+	mu, ok := value.(*sync.Mutex)
+	if !ok {
+		mu = &sync.Mutex{}
+		creditsProbeMu.Store(key, mu)
+	}
+	return mu
+}
+
+// userResourceResponse models the get-user-resource billing payload. Only the
+// per-cycle remaining credits are needed; CycleCapacityRemainPrecise is the
+// authoritative field and is serialized as a string.
+type userResourceResponse struct {
+	Response struct {
+		Data struct {
+			Accounts []struct {
+				ProductCode                string  `json:"ProductCode"`
+				Status                     int     `json:"Status"`
+				CycleCapacityRemainPrecise string  `json:"CycleCapacityRemainPrecise"`
+				CycleCapacityRemain        float64 `json:"CycleCapacityRemain"`
+			} `json:"Accounts"`
+		} `json:"Data"`
+	} `json:"Response"`
+}
+
+// totalRemainingCredits sums the usable per-cycle balance across a user's
+// CodeBuddy resource packages. Multiple packages stack (a base package plus
+// bonus packages), so the credential is only exhausted once all of them are.
+func (r userResourceResponse) totalRemainingCredits() float64 {
+	total := 0.0
+	for _, account := range r.Response.Data.Accounts {
+		if code := strings.TrimSpace(account.ProductCode); code != "" && code != quotaProductCode {
+			continue
+		}
+		remaining := account.CycleCapacityRemain
+		if precise := strings.TrimSpace(account.CycleCapacityRemainPrecise); precise != "" {
+			if parsed, errParse := strconv.ParseFloat(precise, 64); errParse == nil {
+				remaining = parsed
+			}
+		}
+		if remaining > 0 {
+			total += remaining
+		}
+	}
+	return total
+}
+
+// probeCredits queries the billing API for the credential's remaining credits
+// and caches the result. Concurrent callers for the same credential collapse
+// onto one upstream call.
+func probeCredits(sa *storedAuth, key string) (creditsState, error) {
+	if key == "" {
+		return creditsState{}, fmt.Errorf("credits probe: missing auth key")
+	}
+	mu := creditsProbeLock(key)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Another caller may have refreshed the balance while we waited on the lock.
+	if state, ok := loadCreditsState(key); ok && !state.stale(time.Now()) {
+		return state, nil
+	}
+
+	reqBody, errMarshal := json.Marshal(map[string]any{
+		"PageNumber":      1,
+		"PageSize":        100,
+		"ProductCode":     quotaProductCode,
+		"Status":          []int{0, 3},
+		"OnlyValidPeriod": true,
+	})
+	if errMarshal != nil {
+		return creditsState{}, fmt.Errorf("credits probe: marshal request: %w", errMarshal)
+	}
+
+	client := &http.Client{
+		Timeout:   quotaProbeTimeout,
+		Transport: sharedHTTPClient().Transport,
+	}
+	data, status, errCall := doJSON(client, http.MethodPost, endpointUserResource, func(r *http.Request) {
+		backendHeaders(r, sa)
+	}, bytes.NewReader(reqBody))
+	if errCall != nil {
+		if status > 0 {
+			return creditsState{}, fmt.Errorf("credits probe: upstream %d: %w", status, errCall)
+		}
+		return creditsState{}, fmt.Errorf("credits probe: %w", errCall)
+	}
+
+	var resource userResourceResponse
+	if errUnmarshal := json.Unmarshal(data, &resource); errUnmarshal != nil {
+		return creditsState{}, fmt.Errorf("credits probe: parse response: %w", errUnmarshal)
+	}
+
+	now := time.Now()
+	remaining := resource.totalRemainingCredits()
+	storeCreditsBalance(key, remaining, now)
+	state, _ := loadCreditsState(key)
+	return state, nil
+}
+
+// quotaGate is the pre-flight credits check. It short-circuits a request when
+// the credential is known to be exhausted, so CPA cools it down and rotates to
+// another credential instead of burning a round trip upstream.
+//
+// A probe failure is never fatal: the request proceeds and the upstream response
+// remains the authoritative quota signal.
+func quotaGate(sa *storedAuth, authID string) error {
+	key := creditsKey(authID, sa)
+	if key == "" {
+		return nil
+	}
+	now := time.Now()
+
+	state, cached := loadCreditsState(key)
+	if cached && state.exhausted(now) {
+		return quotaExhaustedError(state.remaining)
+	}
+	if cached && !state.stale(now) {
+		return nil
+	}
+
+	probed, errProbe := probeCredits(sa, key)
+	if errProbe != nil {
+		// Balance unknown: let the request through and rely on the upstream verdict.
+		return nil
+	}
+	// The balance just moved from unknown/stale to fresh, so publish it.
+	persistCreditsNote(sa, key)
+	if probed.remaining <= 0 {
+		return quotaExhaustedError(probed.remaining)
+	}
+	return nil
+}
+
+// debitCredits subtracts an observed credit consumption from the cached balance
+// so the note reflects spend between billing probes.
+//
+// This is a local estimate layered on top of the last authoritative reading: it
+// keeps the displayed balance moving in real time, and the next probe (on token
+// refresh, or when the cache goes stale) reconciles it with the billing API. The
+// balance is never pushed below zero, and reaching zero locally does NOT start a
+// cooldown — only the billing API or an upstream quota error may do that, so a
+// drifted estimate can't strand a credential that still has credits.
+func debitCredits(key string, credit float64) (creditsState, bool) {
+	if key == "" || credit <= 0 {
+		return creditsState{}, false
+	}
+	// Serialize with the probe path: read-modify-write must be atomic or
+	// concurrent requests debit from the same baseline and lose a deduction.
+	mu := creditsProbeLock(key)
+	mu.Lock()
+	defer mu.Unlock()
+
+	state, ok := loadCreditsState(key)
+	if !ok || !state.known {
+		// No authoritative baseline yet, so there is nothing to debit from.
+		return creditsState{}, false
+	}
+	state.remaining -= credit
+	if state.remaining < 0 {
+		state.remaining = 0
+	}
+	state.estimated = true
+	creditsByAuth.Store(key, state)
+	return state, true
+}
+
+// trackCreditSpend records the credits a completed request consumed and refreshes
+// the credential note. Best effort: never affects the request outcome.
+func trackCreditSpend(sa *storedAuth, authID string, credit float64) {
+	if credit <= 0 {
+		return
+	}
+	key := creditsKey(authID, sa)
+	if key == "" {
+		return
+	}
+	if _, ok := debitCredits(key, credit); !ok {
+		return
+	}
+	persistCreditsNote(sa, key)
+}
+
+// creditsNote renders the credential note shown on the management panel's
+// credential card. CodeBuddy meters prepaid credits, so the remaining balance
+// plus the local cooldown state is the useful summary. The text is Chinese to
+// match the CodeBuddy console and this plugin's user-facing docs.
+func creditsNote(state creditsState, now time.Time) string {
+	if !state.known {
+		return ""
+	}
+	amount := fmt.Sprintf("%.2f", state.remaining)
+	if state.estimated {
+		// "~" marks a balance carried forward by local debits rather than one
+		// read straight from the billing API.
+		amount = "~" + amount
+	}
+	if state.exhausted(now) {
+		return fmt.Sprintf("剩余积分 %s · 冷却中", amount)
+	}
+	return fmt.Sprintf("剩余积分 %s", amount)
+}
+
+// refreshCreditsNote probes the balance and writes the resulting summary onto
+// sa.Note. A probe failure leaves the previous note untouched: a stale balance
+// is more useful on the card than an empty field.
+func refreshCreditsNote(sa *storedAuth, authID string) {
+	if sa == nil {
+		return
+	}
+	key := creditsKey(authID, sa)
+	if key == "" {
+		return
+	}
+	state, errProbe := probeCredits(sa, key)
+	if errProbe != nil {
+		log("debug", "workbuddy: credits probe failed", map[string]any{"error": errProbe.Error()})
+		return
+	}
+	if note := creditsNote(state, time.Now()); note != "" {
+		sa.Note = note
+	}
+}
+
+// persistCreditsNote writes the current credits summary straight to the auth
+// file via host.auth.save, which also upserts the in-memory record so the
+// credential card reflects it without waiting for the next refresh cycle.
+//
+// Best effort: the note is a display detail and must never fail a request.
+func persistCreditsNote(sa *storedAuth, key string) {
+	if sa == nil || key == "" {
+		return
+	}
+	state, ok := loadCreditsState(key)
+	if !ok {
+		return
+	}
+	note := creditsNote(state, time.Now())
+	if note == "" || note == strings.TrimSpace(sa.Note) {
+		return
+	}
+	snapshot := *sa
+	snapshot.Note = note
+	storage, errMarshal := json.Marshal(&snapshot)
+	if errMarshal != nil {
+		return
+	}
+	body, errBody := json.Marshal(map[string]any{"name": authFileName, "json": json.RawMessage(storage)})
+	if errBody != nil {
+		return
+	}
+	if _, errSave := hostCall(pluginabi.MethodHostAuthSave, body); errSave != nil {
+		log("debug", "workbuddy: persist credits note failed", map[string]any{"error": errSave.Error()})
+		return
+	}
+	sa.Note = note
+}
+
+func quotaExhaustedError(remaining float64) *upstreamError {
+	return newUpstreamError(
+		quotaExhaustedStatus,
+		"credits_exhausted",
+		fmt.Sprintf("workbuddy: CodeBuddy credits exhausted (remaining=%.2f); credential cooled down for %s", remaining, quotaCooldown),
+	)
+}
+
+// classifyUpstreamFailure maps an upstream chat failure onto a status-carrying
+// error, recognising the quota-exhaustion cases so they drive credential
+// cooldown rather than looking like generic faults.
+func classifyUpstreamFailure(status int, body []byte, sa *storedAuth, authID string) *upstreamError {
+	message := truncate(strings.TrimSpace(string(body)), 400)
+	code := ""
+	if len(body) > 0 {
+		var env apiEnvelope
+		if json.Unmarshal(body, &env) == nil && env.Code != 0 {
+			code = strconv.Itoa(env.Code)
+			if msg := strings.TrimSpace(env.Msg); msg != "" {
+				message = msg
+			}
+		}
+	}
+
+	if isQuotaExhaustedFailure(status, code, message) {
+		key := creditsKey(authID, sa)
+		markCreditsExhausted(key, time.Now())
+		// Re-probe in the background so the cached balance reflects reality once
+		// the user tops the account up, then publish the result to the card.
+		if key != "" && sa != nil {
+			go func(snapshot storedAuth, probeKey string) {
+				_, _ = probeCredits(&snapshot, probeKey)
+				persistCreditsNote(&snapshot, probeKey)
+			}(*sa, key)
+		}
+		detail := message
+		if detail == "" {
+			detail = fmt.Sprintf("upstream %d", status)
+		}
+		return newUpstreamError(
+			quotaExhaustedStatus,
+			"credits_exhausted",
+			fmt.Sprintf("workbuddy: CodeBuddy credits exhausted (%s); credential cooled down for %s", detail, quotaCooldown),
+		)
+	}
+
+	detail := message
+	if detail == "" {
+		detail = http.StatusText(status)
+	}
+	errUpstream := newUpstreamError(status, code, fmt.Sprintf("workbuddy: upstream %d: %s", status, detail))
+	// 5xx and 408 are transient upstream faults; the host retries those.
+	switch status {
+	case http.StatusRequestTimeout,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		errUpstream = errUpstream.withRetryable(true)
+	}
+	return errUpstream
+}
+
+// quotaFailureKeywords are the CodeBuddy phrasings that indicate the account has
+// run out of credits rather than hit a transient rate limit.
+var quotaFailureKeywords = []string{
+	"insufficient",
+	"quota",
+	"credits",
+	"额度",
+	"余额",
+	"积分",
+	"用完",
+	"耗尽",
+	"不足",
+	"超出限制",
+}
+
+func isQuotaExhaustedFailure(status int, code, message string) bool {
+	// 402 Payment Required and 429 Too Many Requests are unambiguous.
+	if status == http.StatusPaymentRequired || status == http.StatusTooManyRequests {
+		return true
+	}
+	lower := strings.ToLower(message)
+	for _, keyword := range quotaFailureKeywords {
+		if strings.Contains(lower, keyword) {
+			return true
+		}
+	}
+	return false
 }
 
 // -----------------------------------------------------------------------------
@@ -675,6 +1186,9 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	sa, err := parseStored(req.StorageJSON)
 	if err != nil {
 		return nil, err
+	}
+	if errQuota := quotaGate(sa, req.AuthID); errQuota != nil {
+		return nil, errQuota
 	}
 	// CodeBuddy rejects non-stream requests (code 11101), so always stream
 	// upstream and fold the chunks into a single chat.completion object.
@@ -691,12 +1205,13 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		payload, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(payload), 200))
+		return nil, classifyUpstreamFailure(resp.StatusCode, payload, sa, req.AuthID)
 	}
-	completion, err := aggregateCompletion(resp.Body, req.Model)
+	completion, spent, err := aggregateCompletion(resp.Body, req.Model)
 	if err != nil {
 		return nil, err
 	}
+	trackCreditSpend(sa, req.AuthID, spent)
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 }
 
@@ -717,6 +1232,9 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if errQuota := quotaGate(sa, req.AuthID); errQuota != nil {
+		return nil, errQuota
+	}
 	body := req.Payload
 	if len(body) == 0 {
 		body = req.OriginalRequest
@@ -728,23 +1246,38 @@ func handleExecStream(raw []byte) ([]byte, error) {
 
 	// No async stream id → fall back to synchronous chunk collection.
 	if req.StreamID == "" {
-		chunks, errCollect := collectUpstreamStream(body, sa, sseFramed)
+		chunks, errCollect := collectUpstreamStream(body, sa, sseFramed, req.AuthID)
 		if errCollect != nil {
 			return nil, errCollect
 		}
 		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 	}
 
-	// Async: return immediately with empty chunks. A goroutine pumps the upstream
-	// and emits each chunk via host.stream.emit so the client sees true streaming.
+	// Async streaming still opens the upstream connection synchronously so an
+	// error status can be returned through the RPC envelope. Emitting it as a
+	// stream chunk instead would hide the failure from the host: by the time a
+	// chunk is emitted this call has already returned OK, so MarkResult would
+	// record the request as a success and never cool the credential down.
 	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
 	if err != nil {
-		streamEmitError(req.StreamID, err.Error())
-		streamClose(req.StreamID)
-		return okEnvelope(streamResponse{Headers: headers})
+		return nil, err
 	}
 	backendHeaders(httpReq, sa)
-	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed)
+	resp, errDo := sharedHTTPClient().Do(httpReq)
+	if errDo != nil {
+		return nil, fmt.Errorf("http_error: %w", errDo)
+	}
+	if resp.StatusCode >= 400 {
+		errPayload, _ := io.ReadAll(resp.Body)
+		if errClose := resp.Body.Close(); errClose != nil {
+			return nil, fmt.Errorf("workbuddy: close upstream error body: %w", errClose)
+		}
+		return nil, classifyUpstreamFailure(resp.StatusCode, errPayload, sa, req.AuthID)
+	}
+
+	// Status is good: hand the open body to the pump, which emits each chunk via
+	// host.stream.emit so the client sees true streaming.
+	go pumpUpstreamStream(resp, req.StreamID, sseFramed, sa, req.AuthID)
 	return okEnvelope(streamResponse{Headers: headers})
 }
 
@@ -756,32 +1289,35 @@ func streamHeaders() http.Header {
 	return h
 }
 
-// pumpUpstreamStream reads the upstream SSE response in the background and
-// emits each cleaned chunk to the host stream. It closes the stream when done.
-// An emit failure (client disconnected → host closed the stream) aborts the
-// pump so we stop reading a dead upstream.
-func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) {
-	resp, err := sharedHTTPClient().Do(httpReq)
-	if err != nil {
-		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
-		streamClose(streamID)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		errPayload, _ := io.ReadAll(resp.Body)
-		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200)))
-		streamClose(streamID)
-		return
-	}
+// pumpUpstreamStream reads an already-open upstream SSE response in the
+// background and emits each cleaned chunk to the host stream. It closes the
+// stream when done. An emit failure (client disconnected → host closed the
+// stream) aborts the pump so we stop reading a dead upstream.
+//
+// The caller has already validated the response status, so any failure here is
+// mid-stream and can only be surfaced as a stream error.
+func pumpUpstreamStream(resp *http.Response, streamID string, sseFramed bool, sa *storedAuth, authID string) {
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			streamEmitError(streamID, fmt.Sprintf("close upstream body: %v", errClose))
+		}
+	}()
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	spent := 0.0
 	for scanner.Scan() {
 		content := stripDataPrefix(scanner.Text())
 		if content == "" || content == "[DONE]" {
 			continue
 		}
-		cleaned := cleanChunkJSON(content)
+		cleaned, credit, hasCredit := cleanChunkJSON(content)
+		if hasCredit {
+			// CodeBuddy reports a running total per chunk, so keep the largest
+			// value rather than summing partial reports.
+			if credit > spent {
+				spent = credit
+			}
+		}
 		if cleaned == "" {
 			continue
 		}
@@ -792,12 +1328,16 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) 
 			break
 		}
 	}
+	if errScan := scanner.Err(); errScan != nil {
+		streamEmitError(streamID, fmt.Sprintf("read upstream stream: %v", errScan))
+	}
+	trackCreditSpend(sa, authID, spent)
 	streamClose(streamID)
 }
 
 // collectUpstreamStream is the synchronous fallback (no async stream id): drain
 // the upstream, clean each chunk, return them as a slice.
-func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
+func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, authID string) ([]pluginapi.ExecutorStreamChunk, error) {
 	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -807,12 +1347,18 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]plugi
 	if err != nil {
 		return nil, fmt.Errorf("http_error: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log("warn", "workbuddy: close upstream body failed", map[string]any{"error": errClose.Error()})
+		}
+	}()
 	if resp.StatusCode >= 400 {
 		errPayload, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200))
+		return nil, classifyUpstreamFailure(resp.StatusCode, errPayload, sa, authID)
 	}
-	return aggregateSSE(resp.Body, sseFramed), nil
+	chunks, spent := aggregateSSE(resp.Body, sseFramed)
+	trackCreditSpend(sa, authID, spent)
+	return chunks, nil
 }
 
 // clientNeedsSSEFrame reports whether chunk payloads must carry their own
@@ -836,17 +1382,21 @@ func clientNeedsSSEFrame(metadata map[string]any) bool {
 // (the host appends its own stream terminator). When sseFramed is true each
 // payload is emitted as a "data: " line for cross-format translators; otherwise
 // the payload is the raw JSON object and the host chat-completions writer adds
-// the framing itself.
-func aggregateSSE(r io.Reader, sseFramed bool) []pluginapi.ExecutorStreamChunk {
+// the framing itself. The credits consumed by the response are returned too.
+func aggregateSSE(r io.Reader, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, float64) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	var chunks []pluginapi.ExecutorStreamChunk
+	spent := 0.0
 	for scanner.Scan() {
 		content := stripDataPrefix(scanner.Text())
 		if content == "" || content == "[DONE]" {
 			continue
 		}
-		cleaned := cleanChunkJSON(content)
+		cleaned, credit, hasCredit := cleanChunkJSON(content)
+		if hasCredit && credit > spent {
+			spent = credit
+		}
 		if cleaned == "" {
 			continue
 		}
@@ -855,16 +1405,19 @@ func aggregateSSE(r io.Reader, sseFramed bool) []pluginapi.ExecutorStreamChunk {
 		}
 		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: []byte(cleaned)})
 	}
-	return chunks
+	return chunks, spent
 }
 
 // cleanChunkJSON strips empty-valued fields (null/""/[]/{}) from choice deltas
 // so strict clients don't trip on {"function_call":null,"tool_calls":[]}.
-func cleanChunkJSON(s string) string {
+// It also reports the credit consumption the chunk carries, so callers can
+// track spend without parsing the payload a second time.
+func cleanChunkJSON(s string) (string, float64, bool) {
 	var obj map[string]any
 	if json.Unmarshal([]byte(s), &obj) != nil {
-		return s
+		return s, 0, false
 	}
+	credit, hasCredit := chunkCredit(obj)
 	if choices, ok := obj["choices"].([]any); ok {
 		for _, c := range choices {
 			choice, ok := c.(map[string]any)
@@ -882,9 +1435,58 @@ func cleanChunkJSON(s string) string {
 	}
 	out, err := json.Marshal(obj)
 	if err != nil {
-		return s
+		return s, credit, hasCredit
 	}
-	return string(out)
+	return string(out), credit, hasCredit
+}
+
+// creditFieldNames are the spellings CodeBuddy may use for the credits consumed
+// by a request. The value is a cost, not a balance.
+var creditFieldNames = []string{"credit", "credits", "creditUsed", "credit_used", "creditCost", "credit_cost"}
+
+// chunkCredit extracts the credit consumption reported by one response chunk,
+// checking both the top level and the usage block.
+func chunkCredit(obj map[string]any) (float64, bool) {
+	if credit, ok := creditFromMap(obj); ok {
+		return credit, true
+	}
+	if usage, ok := obj["usage"].(map[string]any); ok {
+		return creditFromMap(usage)
+	}
+	return 0, false
+}
+
+func creditFromMap(source map[string]any) (float64, bool) {
+	for _, name := range creditFieldNames {
+		value, ok := source[name]
+		if !ok {
+			continue
+		}
+		if credit, ok := numericValue(value); ok {
+			return credit, true
+		}
+	}
+	return 0, false
+}
+
+// numericValue reads a credit amount that may arrive as a JSON number or as a
+// string (CodeBuddy serializes precise decimals as strings elsewhere).
+func numericValue(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case json.Number:
+		parsed, errParse := v.Float64()
+		return parsed, errParse == nil
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return 0, false
+		}
+		parsed, errParse := strconv.ParseFloat(trimmed, 64)
+		return parsed, errParse == nil
+	}
+	return 0, false
 }
 
 func isEmptyValue(v any) bool {
@@ -1015,11 +1617,12 @@ func forceMaxThinking(obj map[string]any) bool {
 
 // aggregateCompletion folds an SSE stream into a single non-streaming
 // chat.completion object (used for non-stream client requests).
-func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
+func aggregateCompletion(r io.Reader, model string) ([]byte, float64, error) {
 	var content, reasoning, role, respModel, respID, finish string
 	var created int64
 	var usage map[string]any
 	var toolCalls []map[string]any
+	spent := 0.0
 
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
@@ -1031,6 +1634,9 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		var chunk map[string]any
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			continue
+		}
+		if credit, ok := chunkCredit(chunk); ok && credit > spent {
+			spent = credit
 		}
 		if v, ok := chunk["id"].(string); ok && v != "" {
 			respID = v
@@ -1097,9 +1703,9 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	}
 	out, err := json.Marshal(result)
 	if err != nil {
-		return nil, err
+		return nil, spent, err
 	}
-	return out, nil
+	return out, spent, nil
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -1119,6 +1725,31 @@ func stripDataPrefix(s string) string {
 	return s
 }
 
+// upstreamError carries an upstream HTTP status (plus CodeBuddy's business
+// code, when known) out of the executor so the host can classify the failure.
+// The host's decodeEnvelopeResult only surfaces envelope.Error.HTTPStatus, so
+// this type is what makes a 429 reach MarkResult as a quota signal instead of
+// being swallowed as a plain plugin error.
+type upstreamError struct {
+	code      string // CodeBuddy business code, e.g. "11101" or "" for HTTP-level failures
+	message   string
+	status    int // upstream HTTP status, 0 if unknown
+	retryable bool
+}
+
+func (e *upstreamError) Error() string {
+	return e.message
+}
+
+func newUpstreamError(status int, code, message string) *upstreamError {
+	return &upstreamError{status: status, code: code, message: message}
+}
+
+func (e *upstreamError) withRetryable(retryable bool) *upstreamError {
+	e.retryable = retryable
+	return e
+}
+
 // -----------------------------------------------------------------------------
 // envelope helpers
 // -----------------------------------------------------------------------------
@@ -1134,6 +1765,28 @@ func okEnvelope(v any) ([]byte, error) {
 func errorEnvelope(code, message string) []byte {
 	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
 	return raw
+}
+
+// statusEnvelope renders a plugin error that carries an upstream HTTP status so
+// the host can classify it (429 → quota cooldown, 401 → refresh, ...).
+func statusEnvelope(code, message string, status int, retryable bool) []byte {
+	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
+		Code:       code,
+		Message:    message,
+		Retryable:  retryable,
+		HTTPStatus: status,
+	}})
+	return raw
+}
+
+// errorEnvelopeFor renders err as a plugin error envelope, preserving the
+// upstream status when err carries one.
+func errorEnvelopeFor(err error) []byte {
+	var upstream *upstreamError
+	if errors.As(err, &upstream) && upstream != nil {
+		return statusEnvelope(upstream.code, upstream.Error(), upstream.status, upstream.retryable)
+	}
+	return errorEnvelope("plugin_error", err.Error())
 }
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
