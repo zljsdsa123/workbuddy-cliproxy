@@ -28,7 +28,7 @@ const (
 	cooldown = 30 * time.Minute
 	// balanceTTL bounds how long a successful balance reading is trusted
 	// before the next upstream call re-probes it.
-	balanceTTL = 10 * time.Minute
+	balanceTTL = 6 * time.Hour
 	// probeTimeout bounds the billing API call so a slow balance probe
 	// cannot stall the chat request that triggered it.
 	probeTimeout = 10 * time.Second
