@@ -35,6 +35,9 @@ func ParseAuth(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	// 宿主在 parse 上带系统代理（全局 proxy-url）；捕获它供 executor 等
+	// 无 Host 的路径回退。parse 在每个凭据扫描/加载时都会跑，最早覆盖。
+	codebuddy.CacheSystemProxy(req.Host.ProxyURL)
 	sa, err := codebuddy.ParseStored(req.RawJSON)
 	if err != nil {
 		// Not a workbuddy credential; let the host try other providers.
@@ -63,7 +66,17 @@ func ToAuthData(sa *codebuddy.StoredAuth) pluginapi.AuthData {
 }
 
 func StartLogin(raw []byte) ([]byte, error) {
-	client := codebuddy.NewLoginClient()
+	// 请求体可空（测试/调用方可直接拉起登录）：仅当携带 JSON 时才解析。
+	var req pluginapi.AuthLoginStartRequest
+	if len(strings.TrimSpace(string(raw))) > 0 {
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+	}
+	codebuddy.CacheSystemProxy(req.Host.ProxyURL)
+	// 登录期还没有凭据文件可带每凭据代理，出网走宿主系统代理（auth/state）。
+	// 系统代理为空 → NewLoginClient 回退共享默认传输。
+	client := codebuddy.NewLoginClient(req.Host.ProxyURL)
 	data, _, err := codebuddy.DoJSON(client, http.MethodPost, codebuddy.EndpointAuthState, nil, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return nil, fmt.Errorf("auth state failed: %w", err)
@@ -87,6 +100,7 @@ func PollLogin(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	codebuddy.CacheSystemProxy(req.Host.ProxyURL)
 	state := strings.TrimSpace(req.State)
 	if state == "" {
 		return nil, fmt.Errorf("poll: empty state")
@@ -159,6 +173,7 @@ func RefreshAuth(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	codebuddy.CacheSystemProxy(req.Host.ProxyURL)
 	sa, err := codebuddy.ParseStored(req.StorageJSON)
 	if err != nil {
 		return nil, fmt.Errorf("refresh: %w", err)
@@ -171,7 +186,10 @@ func RefreshAuth(raw []byte) ([]byte, error) {
 		}
 		r.Header.Set("X-Auth-Refresh-Source", codebuddy.ProviderName)
 	}
-	data, status, err := codebuddy.DoJSON(codebuddy.SharedHTTPClient(), http.MethodPost, codebuddy.EndpointTokenRefresh, headers, nil)
+	// token/refresh 出网按该凭据的生效代理：请求元数据 proxy_url → 凭据文件
+	// 顶层 proxy_url → 系统代理。
+	client := codebuddy.JSONClient(codebuddy.EffectiveProxy(req.Metadata, sa))
+	data, status, err := codebuddy.DoJSON(client, http.MethodPost, codebuddy.EndpointTokenRefresh, headers, nil)
 	if err != nil {
 		if status >= 400 {
 			return nil, wire.NewUpstreamError(status, "", fmt.Sprintf("refresh rejected (HTTP %d)", status))

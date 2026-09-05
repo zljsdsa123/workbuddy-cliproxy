@@ -39,12 +39,13 @@ func SharedHTTPClient() *http.Client {
 }
 
 // NewLoginClient builds an isolated client with its own cookie jar so that the
-// browser login for one state can never leak into another.
-func NewLoginClient() *http.Client {
+// browser login for one state can never leak into another. proxy is the effective
+// proxy for the login's outbound calls (系统代理); empty → 共享默认传输直连。
+func NewLoginClient(proxy string) *http.Client {
 	jar, _ := cookiejar.New(nil)
 	return &http.Client{
 		Timeout:   30 * time.Second,
-		Transport: SharedHTTPClient().Transport,
+		Transport: Transport(proxy),
 		Jar:       jar,
 	}
 }

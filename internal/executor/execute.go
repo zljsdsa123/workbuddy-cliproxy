@@ -42,12 +42,13 @@ func Execute(raw []byte) ([]byte, error) {
 	// CodeBuddy rejects non-stream requests (code 11101), so always stream
 	// upstream and fold the chunks into a single chat.completion object.
 	body := rewriteSystemForUpstream(forceStreamBody(req.Payload, req.OriginalRequest))
+	proxy := codebuddy.EffectiveProxy(req.AuthMetadata, sa)
 	httpReq, err := http.NewRequest(http.MethodPost, codebuddy.EndpointChat, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	codebuddy.BackendHeaders(httpReq, sa)
-	resp, err := codebuddy.SharedHTTPClient().Do(httpReq)
+	resp, err := codebuddy.JSONClient(proxy).Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("http_error: %w", err)
 	}
@@ -89,13 +90,14 @@ func ExecuteStream(raw []byte) ([]byte, error) {
 		body = req.OriginalRequest
 	}
 	body = rewriteSystemForUpstream(body)
+	proxy := codebuddy.EffectiveProxy(req.AuthMetadata, sa)
 
 	headers := streamHeaders()
 	sseFramed := clientNeedsSSEFrame(req.Metadata)
 
 	// No async stream id → fall back to synchronous chunk collection.
 	if req.StreamID == "" {
-		chunks, errCollect := collectUpstreamStream(body, sa, sseFramed, req.AuthID)
+		chunks, errCollect := collectUpstreamStream(body, sa, proxy, sseFramed, req.AuthID)
 		if errCollect != nil {
 			return nil, errCollect
 		}
@@ -112,7 +114,7 @@ func ExecuteStream(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	codebuddy.BackendHeaders(httpReq, sa)
-	resp, errDo := codebuddy.SharedHTTPClient().Do(httpReq)
+	resp, errDo := codebuddy.JSONClient(proxy).Do(httpReq)
 	if errDo != nil {
 		return nil, fmt.Errorf("http_error: %w", errDo)
 	}
@@ -186,13 +188,13 @@ func pumpUpstreamStream(resp *http.Response, streamID string, sseFramed bool, sa
 
 // collectUpstreamStream is the synchronous fallback (no async stream id): drain
 // the upstream, clean each chunk, return them as a slice.
-func collectUpstreamStream(body []byte, sa *codebuddy.StoredAuth, sseFramed bool, authID string) ([]pluginapi.ExecutorStreamChunk, error) {
+func collectUpstreamStream(body []byte, sa *codebuddy.StoredAuth, proxy string, sseFramed bool, authID string) ([]pluginapi.ExecutorStreamChunk, error) {
 	httpReq, err := http.NewRequest(http.MethodPost, codebuddy.EndpointChat, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	codebuddy.BackendHeaders(httpReq, sa)
-	resp, err := codebuddy.SharedHTTPClient().Do(httpReq)
+	resp, err := codebuddy.JSONClient(proxy).Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("http_error: %w", err)
 	}

@@ -55,6 +55,12 @@ func RefreshNote(sa *codebuddy.StoredAuth, authID string) {
 // file via host.auth.save, which also upserts the in-memory record so the
 // credential card reflects it without waiting for the next refresh cycle.
 //
+// Only the "note" field is meant to change: everything else in the credential
+// document (host-managed "type"/"disabled", tokens, account) must round-trip
+// untouched. Re-marshaling StoredAuth alone would drop those host fields and
+// orphan the file (its "type" wiped, the next rescan can rebind it to another
+// provider) — so persistNote patches the original document instead.
+//
 // Best effort: the note is a display detail and must never fail a request.
 func persistNote(sa *codebuddy.StoredAuth, key string) {
 	if sa == nil || key == "" {
@@ -68,9 +74,7 @@ func persistNote(sa *codebuddy.StoredAuth, key string) {
 	if note == "" || note == strings.TrimSpace(sa.Note) {
 		return
 	}
-	snapshot := *sa
-	snapshot.Note = note
-	storage, errMarshal := json.Marshal(&snapshot)
+	storage, errMarshal := storageWithNote(sa, note)
 	if errMarshal != nil {
 		return
 	}
@@ -79,4 +83,25 @@ func persistNote(sa *codebuddy.StoredAuth, key string) {
 		return
 	}
 	sa.Note = note
+}
+
+// storageWithNote renders the credential bytes to persist with an updated note.
+// When the original document is available (sa.RawDoc), only the "note" top-level
+// field is replaced and every other field is preserved verbatim. If no raw
+// document is at hand (e.g. a struct built by hand in tests) it falls back to a
+// struct snapshot.
+func storageWithNote(sa *codebuddy.StoredAuth, note string) (json.RawMessage, error) {
+	if len(sa.RawDoc) > 0 {
+		var doc map[string]any
+		if err := json.Unmarshal(sa.RawDoc, &doc); err == nil {
+			if doc == nil {
+				doc = make(map[string]any)
+			}
+			doc["note"] = note
+			return json.Marshal(doc)
+		}
+	}
+	snapshot := *sa
+	snapshot.Note = note
+	return json.Marshal(&snapshot)
 }

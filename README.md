@@ -8,6 +8,27 @@
 
 在 CPA 里注册为 `workbuddy` provider:负责 CodeBuddy 扫码登录、token 刷新,并把请求转发到 `copilot.tencent.com/v2/chat/completions`。登录后凭据存为 `workbuddy.json`。
 
+## 出站代理
+
+插件的 CodeBuddy 上游出网(对话 / token 刷新 / 登录 / 积分探测)跟随 CPA 的代理语义,不再各自裸连:
+
+- **系统代理**:读宿主带 `Host` 的请求(auth.parse / login.* / refresh)上报的全局 `proxy-url`(CPA 配置 `proxy-url`)。executor 对话请求不带 `Host`,因此插件把它缓存在进程内作回退——宿主每次扫描/刷新凭据都会带来最新的系统代理。
+- **认证文件单独配置代理**:在凭据文件顶层加 `"proxy_url": "..."`(CPA 面板改 proxy_url 时也会写入同一个字段),该账号的对话 / 刷新 / 积分探测就单独走这个代理,覆盖系统代理。
+- **支持协议**:`http` / `https` / `socks5` / `socks5h`,用户名密码带在 URL 里(`socks5://user:pass@host:1080`);`direct` 或 `none` 显式绕过全局与环境代理。解析与传输复用 CPA 自带的 `sdk/proxyutil`,与宿主其余出网路径同一套语义。
+- **优先级**:请求元数据 `proxy_url` → 凭据文件顶层 `proxy_url` → 系统代理 → 直连/继承环境代理。任一环节写 `direct`/`none` 即显式直连。
+- **cookie 语义不变**:走代理只是换了连接层,登录用的独立 cookie jar、共享客户端的 jar 与超时都保持原样。
+- **失败即放行**:代理配置非法/不支持时回退默认直连并记日志,不会让一条坏代理把请求整条打断。
+
+```json
+// auths/workbuddy.json 顶层加一行即可让该账号走独立代理:
+{
+  "auth": { "...": "…" },
+  "account": { "...": "…" },
+  "type": "workbuddy",
+  "proxy_url": "socks5://127.0.0.1:1080"
+}
+```
+
 ## 模型
 
 `hy4-preview` · `hy3` · `glm-5.3-flash` · `deepseek-v4-flash`

@@ -212,9 +212,11 @@ func probeCredits(sa *codebuddy.StoredAuth, key string) (creditsState, error) {
 		return creditsState{}, fmt.Errorf("credits probe: marshal request: %w", errMarshal)
 	}
 
+	// 按该凭据的生效代理出网：走与 JSONClient 同一份连接池传输（短超时另配）。
+	// 生效代理为空 → codebuddy.Transport 返回共享默认传输，语义与改造前一致。
 	client := &http.Client{
 		Timeout:   probeTimeout,
-		Transport: codebuddy.SharedHTTPClient().Transport,
+		Transport: codebuddy.Transport(codebuddy.EffectiveProxy(nil, sa)),
 	}
 	data, status, errCall := codebuddy.DoJSON(client, http.MethodPost, codebuddy.EndpointUserResource, func(r *http.Request) {
 		codebuddy.BackendHeaders(r, sa)

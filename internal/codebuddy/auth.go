@@ -1,6 +1,7 @@
 package codebuddy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 )
@@ -11,10 +12,24 @@ import (
 // credential card. The host merges auth metadata back into this file, so the
 // field round-trips: it is written from metadata on save and read back here on
 // parse, which keeps the balance visible across restarts until the next probe.
+//
+// CPA merges its host-managed metadata as top-level keys of this same document,
+// so a credential routed through its own proxy carries "proxy_url" here; it is
+// captured on parse so every outbound leg for the credential goes through the
+// same proxy the management panel shows.
 type StoredAuth struct {
-	Auth    StoredTokens  `json:"auth"`
-	Account StoredAccount `json:"account"`
-	Note    string        `json:"note,omitempty"`
+	Auth     StoredTokens  `json:"auth"`
+	Account  StoredAccount `json:"account"`
+	Note     string        `json:"note,omitempty"`
+	ProxyURL string        `json:"proxy_url,omitempty"`
+
+	// RawDoc is the exact credential document the host handed to this process.
+	// StoredAuth is only a projection of it: host-managed top-level fields
+	// ("type", "disabled", "priority", …) live in the document but not in this
+	// struct. Keeping the original lets persistNote rewrite just the "note"
+	// field and leave everything else intact, instead of re-marshaling a bare
+	// struct and wiping fields it does not model.
+	RawDoc json.RawMessage `json:"-"`
 }
 
 type StoredTokens struct {
@@ -53,7 +68,7 @@ type AuthStateData struct {
 }
 
 func ParseStored(raw []byte) (*StoredAuth, error) {
-	if len(raw) == 0 {
+	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, fmt.Errorf("empty auth storage")
 	}
 	var sa StoredAuth
@@ -63,5 +78,6 @@ func ParseStored(raw []byte) (*StoredAuth, error) {
 	if sa.Auth.AccessToken == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
+	sa.RawDoc = append(json.RawMessage(nil), raw...)
 	return &sa, nil
 }
