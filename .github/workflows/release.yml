@@ -38,7 +38,7 @@ jobs:
             goos: windows
             goarch: amd64
             ext: dll
-            cc: x86_64-w64-mingw-w64-gcc
+            cc: x86_64-w64-mingw32-gcc
             apt: gcc-mingw-w64-x86-64
           - runner: ubuntu-latest
             goos: windows
