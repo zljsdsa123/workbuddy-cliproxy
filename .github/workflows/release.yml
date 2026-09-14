@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+            ext: dylib
+          - runner: macos-latest
+            goos: darwin
+            goarch: amd64
+            ext: dylib
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: so
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            ext: so
+            cc: aarch64-linux-gnu-gcc
+            apt: gcc-aarch64-linux-gnu
+          - runner: ubuntu-latest
+            goos: windows
+            goarch: amd64
+            ext: dll
+            cc: x86_64-w64-mingw-w64-gcc
+            apt: gcc-mingw-w64-x86-64
+          - runner: ubuntu-latest
+            goos: windows
+            goarch: arm64
+            ext: dll
+            cc: aarch64-w64-mingw32-clang
+            llvm-mingw: "20260908"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cross compiler (apt)
+        if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Install cross compiler (llvm-mingw)
+        if: matrix.llvm-mingw != ''
+        run: |
+          ver="${{ matrix.llvm-mingw }}"
+          curl -fsSL \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${ver}/llvm-mingw-${ver}-ucrt-ubuntu-22.04-x86_64.tar.xz" \
+            -o /tmp/llvm-mingw.tar.xz
+          sudo mkdir -p /opt/llvm-mingw
+          sudo tar -xf /tmp/llvm-mingw.tar.xz -C /opt/llvm-mingw --strip-components=1
+          echo "/opt/llvm-mingw/bin" >> "$GITHUB_PATH"
+
+      - name: Test
+        run: go test ./... && go vet ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+        run: |
+          out="dist/workbuddy-${GOOS}-${GOARCH}"
+          mkdir -p "$out"
+          go build -buildmode=c-shared -o "$out/workbuddy.${{ matrix.ext }}" .
+          rm -f "$out/workbuddy.h"
+
+      - name: Package
+        run: |
+          cd dist
+          zip "workbuddy-${{ matrix.goos }}-${{ matrix.goarch }}.zip" \
+            "workbuddy-${{ matrix.goos }}-${{ matrix.goarch }}/workbuddy.${{ matrix.ext }}"
+          shasum -a 256 "workbuddy-${{ matrix.goos }}-${{ matrix.goarch }}.zip" \
+            > "workbuddy-${{ matrix.goos }}-${{ matrix.goarch }}.sha256"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/workbuddy-${{ matrix.goos }}-${{ matrix.goarch }}.zip
+            dist/workbuddy-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
