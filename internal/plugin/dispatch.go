@@ -41,6 +41,8 @@ func HandleMethod(method string, request []byte) ([]byte, error) {
 		return executor.Execute(request)
 	case pluginabi.MethodExecutorExecuteStream:
 		return executor.ExecuteStream(request)
+	case pluginabi.MethodExecutorCountTokens:
+		return executor.CountTokens(request)
 	default:
 		return wire.ErrorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
