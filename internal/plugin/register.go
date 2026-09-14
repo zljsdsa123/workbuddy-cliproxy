@@ -52,7 +52,7 @@ func staticModels() []pluginapi.ModelInfo {
 		{"hy4-preview", "Hy4 Preview", 1000000},
 		{"hy3", "Hy3", 262144},
 		{"glm-5.3-flash", "GLM-5.3 Flash", 1000000},
-		{"deepseek-v4-flash", "DeepSeek V4 Flash", 1000000},
+		{"deepseek-v4.1-flash", "DeepSeek V4.1 Flash", 1000000},
 	}
 	models := make([]pluginapi.ModelInfo, 0, len(specs))
 	for _, m := range specs {

@@ -31,7 +31,7 @@
 
 ## 模型
 
-`hy4-preview` · `hy3` · `glm-5.3-flash` · `deepseek-v4-flash`
+`hy4-preview` · `hy3` · `glm-5.3-flash` · `deepseek-v4.1-flash`
 
 具体可用性以 CodeBuddy 账号权限为准。
 
