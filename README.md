@@ -37,7 +37,7 @@
 
 ## 安装
 
-**前置**:运行中的 CLIProxyAPI v7.2.x(带 CGO / 插件支持)、CodeBuddy 账号、Go 1.26+ 与 gcc;编译架构需与 CPA 实例一致(amd64 / arm64)。
+**前置**:运行中的 CLIProxyAPI v8.0.78(带 CGO / 插件支持)、CodeBuddy 账号、Go 1.26+ 与 gcc;编译架构需与 CPA 实例一致(amd64 / arm64)。
 
 ```bash
 git clone https://github.com/lovingfish/workbuddy-cliproxy.git

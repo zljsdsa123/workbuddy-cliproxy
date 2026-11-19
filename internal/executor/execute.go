@@ -14,7 +14,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"github.com/lovingfish/workbuddy-cliproxy/internal/codebuddy"
 	"github.com/lovingfish/workbuddy-cliproxy/internal/hostrpc"
