@@ -36,6 +36,16 @@ const (
 	// exhausted. 429 is what drives quota cooldown + credential rotation in
 	// the host's MarkResult handling.
 	exhaustedStatus = http.StatusTooManyRequests
+	// exhaustedReprobeInterval bounds how often the pre-flight gate re-reads the
+	// billing API while a credential is locally cooled down.
+	//
+	// The cached zero is only a snapshot: packages are topped up by hand and a
+	// daily bonus package lands at an arbitrary time. Without a re-check the gate
+	// re-asserts the same 30-minute cooldown from that stale snapshot on every
+	// retry, so a funded account stays locked out for as long as requests keep
+	// arriving. The interval (rather than every request) keeps a burst of retries
+	// collapsed onto a single billing call.
+	exhaustedReprobeInterval = time.Minute
 )
 
 // creditsState is the cached credits balance for one credential.
@@ -188,7 +198,13 @@ func (r userResourceResponse) totalRemainingCredits() float64 {
 // probeCredits queries the billing API for the credential's remaining credits
 // and caches the result. Concurrent callers for the same credential collapse
 // onto one upstream call.
-func probeCredits(sa *codebuddy.StoredAuth, key string) (creditsState, error) {
+//
+// The cached reading is reused only when it is fresh (within maxAge) and, unless
+// clearExhausted is set, not mid-cooldown. That second condition is what gives
+// the pre-flight gate its recovery path: a cooled-down credential always reaches
+// the billing API again instead of being refused off a snapshot that a top-up may
+// already have invalidated.
+func probeCredits(sa *codebuddy.StoredAuth, key string, maxAge time.Duration, clearExhausted bool) (creditsState, error) {
 	if key == "" {
 		return creditsState{}, fmt.Errorf("credits probe: missing auth key")
 	}
@@ -197,8 +213,16 @@ func probeCredits(sa *codebuddy.StoredAuth, key string) (creditsState, error) {
 	defer mu.Unlock()
 
 	// Another caller may have refreshed the balance while we waited on the lock.
-	if state, ok := loadCreditsState(key); ok && !state.stale(time.Now()) {
-		return state, nil
+	now := time.Now()
+	if state, ok := loadCreditsState(key); ok && !state.stale(now) {
+		// A cooled-down credential is always re-read from the billing API, whatever
+		// the cached reading's age: the zero may predate a top-up, and only an
+		// authoritative reading may clear the cooldown. Everything else reuses a
+		// reading that is still inside maxAge.
+		usable := !state.exhausted(now) || clearExhausted
+		if usable && (maxAge <= 0 || now.Sub(state.checkedAt) < maxAge) {
+			return state, nil
+		}
 	}
 
 	reqBody, errMarshal := json.Marshal(map[string]any{
@@ -233,7 +257,6 @@ func probeCredits(sa *codebuddy.StoredAuth, key string) (creditsState, error) {
 		return creditsState{}, fmt.Errorf("credits probe: parse response: %w", errUnmarshal)
 	}
 
-	now := time.Now()
 	remaining := resource.totalRemainingCredits()
 	storeCreditsBalance(key, remaining, now)
 	state, _ := loadCreditsState(key)

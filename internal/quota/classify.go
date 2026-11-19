@@ -43,7 +43,9 @@ func Classify(status int, body []byte, sa *codebuddy.StoredAuth, authID string) 
 		// the user tops the account up, then publish the result to the card.
 		if key != "" && sa != nil {
 			go func(snapshot codebuddy.StoredAuth, probeKey string) {
-				_, _ = probeCredits(&snapshot, probeKey)
+				// maxAge 0 forces a real reading: the point is to find out whether
+				// the account has been topped up since we marked it exhausted.
+				_, _ = probeCredits(&snapshot, probeKey, 0, false)
 				persistNote(&snapshot, probeKey)
 			}(*sa, key)
 		}

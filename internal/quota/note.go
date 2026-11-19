@@ -41,7 +41,9 @@ func RefreshNote(sa *codebuddy.StoredAuth, authID string) {
 	if key == "" {
 		return
 	}
-	state, errProbe := probeCredits(sa, key)
+	// No maxAge: a refresh is an explicit request for a fresh reading, and the
+	// probe lock already collapses concurrent refreshes onto one upstream call.
+	state, errProbe := probeCredits(sa, key, 0, false)
 	if errProbe != nil {
 		hostrpc.Log("debug", "workbuddy: credits probe failed", map[string]any{"error": errProbe.Error()})
 		return

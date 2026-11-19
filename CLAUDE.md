@@ -105,7 +105,7 @@ CodeBuddy 是**预付积分包**而非速率限制，上游不给恢复时间戳
 - **冷却只能由权威来源触发**：计费 API 读到 0，或上游明确报额度耗尽（`markCreditsExhausted`）。本地估算扣到 0 **不会**启动冷却 —— 否则估算漂移会把还有余额的凭据白白锁死。
 - `storeCreditsBalance` 在余额仍为 0 时保留原始 `exhaustedAt`，避免反复探测无限延长冷却窗口。
 - `probeCredits` 和 `debitCredits` **共用同一把 `creditsProbeLock(key)` 互斥锁** —— 探测的写和扣减的 read-modify-write 必须串行，否则并发请求从同一基线扣减会丢失扣减（见 `TestDebitCreditsIsAtomicUnderConcurrency`）。
-- `quota.Gate` 是请求前置检查：已知耗尽直接短路返回 429（省一次上游往返）；探测失败**从不致命**，放行请求、以上游结论为准。
+- `quota.Gate` 是请求前置检查：已知耗尽短路返回 429（省一次上游往返），但**冷却期内不认死本地缓存** —— 超过 `exhaustedReprobeInterval`（1min）就回查一次计费接口，余额 >0 立即解除冷却。这是必需的：CodeBuddy 靠人工充值 + 每天不定时发的裂变包，当初触发冷却的那个 0 可能早已过期，只认缓存会让有额度的账号在整个冷却窗口（客户端持续重试时甚至无限期）一直收到假 429。冷却内探测**失败**时继续拦截（不烧上游往返），冷却外探测失败**从不致命**，放行请求、以上游结论为准。
 - chunk 里的 credit 是**运行总量**不是增量，聚合时取 max 而非求和。
 - 余额摘要写进 `codebuddy.StoredAuth.Note`，经 `hostrpc.AuthSave`（`host.auth.save`）落盘 + upsert 内存记录，显示在管理面板凭据卡片上（中文，与 CodeBuddy 控制台一致）。宿主会把 metadata 合并回 auth 文件，所以 `Note` 必须能 marshal/parse 往返（见 `TestStoredAuthNoteRoundTrips`）。
 
@@ -144,7 +144,7 @@ CodeBuddy 把浏览器登录和 `auth/state` 下发的 state **绑在 cookie 上
 |---|---|
 | `internal/quota/credits_test.go` | 计费响应解析、冷却窗口、余额存取、本地扣减（含并发原子性） |
 | `internal/quota/classify_test.go` | 额度关键词识别、状态码保真、429 能带进信封 |
-| `internal/quota/gate_test.go` | 前置检查放行 / 拦截 |
+| `internal/quota/gate_test.go` | 前置检查放行 / 拦截、冷却期回查恢复 / 限频 / 仍为 0 时继续拦截（含计费接口打桩） |
 | `internal/quota/note_test.go` | 凭据卡片文案 |
 | `internal/wire/envelope_test.go` | 普通 error 不伪造 HTTP 状态 |
 | `internal/hostrpc/hostrpc_test.go` | 传输注入、无 stream id 不发调用、`AuthSave` 必须内联裸 JSON |

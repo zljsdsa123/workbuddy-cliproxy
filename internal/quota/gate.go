@@ -18,22 +18,46 @@ func Gate(sa *codebuddy.StoredAuth, authID string) error {
 		return nil
 	}
 	now := time.Now()
-
 	state, cached := loadCreditsState(key)
-	if cached && state.exhausted(now) {
-		return ExhaustedError(state.remaining)
-	}
-	if cached && !state.stale(now) {
+	exhausted := cached && state.exhausted(now)
+
+	// A cooled-down credential is never rejected off the cached snapshot alone.
+	// CodeBuddy packages are topped up by hand and a daily bonus package lands at
+	// an arbitrary time, so the zero that started the cooldown can already be
+	// stale. Asking the billing API again — at most once per
+	// exhaustedReprobeInterval, so a retry burst collapses onto one call — is what
+	// lets a topped-up account recover immediately instead of staying locked out
+	// for the rest of the cooldown window (or, under retries, indefinitely).
+	probed, fresh := state, false
+	if exhausted {
+		if state.known && now.Sub(state.checkedAt) < exhaustedReprobeInterval {
+			return ExhaustedError(state.remaining)
+		}
+		// clearExhausted lets the reading through even though the cache is still
+		// inside its cooldown; a positive balance then clears the window, a zero
+		// re-affirms it without extending it (see storeCreditsBalance).
+		reading, errProbe := probeCredits(sa, key, exhaustedReprobeInterval, true)
+		if errProbe != nil {
+			// Balance still unknown: keep cooling the credential down rather than
+			// burning a round trip on a request that keeps failing.
+			return ExhaustedError(state.remaining)
+		}
+		probed, fresh = reading, true
+	} else if cached && !state.stale(now) {
 		return nil
+	} else {
+		reading, errProbe := probeCredits(sa, key, 0, false)
+		if errProbe != nil {
+			// Balance unknown: let the request through and rely on the upstream verdict.
+			return nil
+		}
+		probed, fresh = reading, true
 	}
 
-	probed, errProbe := probeCredits(sa, key)
-	if errProbe != nil {
-		// Balance unknown: let the request through and rely on the upstream verdict.
-		return nil
+	if fresh {
+		// The balance just moved from unknown/stale to fresh, so publish it.
+		persistNote(sa, key)
 	}
-	// The balance just moved from unknown/stale to fresh, so publish it.
-	persistNote(sa, key)
 	if probed.remaining <= 0 {
 		return ExhaustedError(probed.remaining)
 	}
