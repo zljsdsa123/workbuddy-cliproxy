@@ -27,9 +27,9 @@ func newRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             codebuddy.ProviderName,
-			Version:          "0.1.0",
-			Author:           "lovingfish (clean-room rebuild; original workbuddy by Sliverkiss)",
-			GitHubRepository: "https://github.com/lovingfish/workbuddy-cliproxy",
+			Version:          "1.0.0",
+			Author:           "zljsdsa123 (clean-room rebuild; original workbuddy by Sliverkiss)",
+			GitHubRepository: "https://github.com/zljsdsa123/workbuddy-cliproxy",
 		},
 		Capabilities: registrationCapability{
 			ModelProvider:         true,
