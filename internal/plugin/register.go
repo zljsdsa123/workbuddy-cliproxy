@@ -49,8 +49,7 @@ func staticModels() []pluginapi.ModelInfo {
 		name          string
 		contextLength int64
 	}{
-		{"hy4-preview", "Hy4 Preview", 1000000},
-		{"hy3", "Hy3", 262144},
+		{"hy4-flash", "Hy4 Flash", 1000000},
 		{"glm-5.3-flash", "GLM-5.3 Flash", 1000000},
 		{"deepseek-v4.1-flash", "DeepSeek V4.1 Flash", 1000000},
 	}

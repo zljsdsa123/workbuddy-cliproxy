@@ -44,7 +44,7 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildmode=c-shared -o workbuddy.
 
 **编译硬约束**：`CGO_ENABLED=1` 必须开启（c-shared 依赖 cgo）；`GOARCH` 必须与运行 CPA 的实例一致（amd64 / arm64），架构不符宿主会加载失败。产物旁边的 `.h` 头文件无用，install 脚本会删掉。
 
-**验证加载成功**：CPA 日志出现 `plugin loaded ... plugin_id=workbuddy`，且 `GET /v1/models` 能看到 `hy4-preview` / `hy3` / `glm-5.3-flash` / `deepseek-v4.1-flash`。
+**验证加载成功**：CPA 日志出现 `plugin loaded ... plugin_id=workbuddy`，且 `GET /v1/models` 能看到 `hy4-flash` / `glm-5.3-flash` / `deepseek-v4.1-flash`。
 
 ## 架构
 

@@ -31,7 +31,7 @@
 
 ## 模型
 
-`hy4-preview` · `hy3` · `glm-5.3-flash` · `deepseek-v4.1-flash`
+`hy4-flash` · `glm-5.3-flash` · `deepseek-v4.1-flash`
 
 具体可用性以 CodeBuddy 账号权限为准。
 
@@ -71,7 +71,7 @@ CPA 默认端口 `8317`,API key 见 `config.yaml` 的 `api-keys`。
 # Claude Code
 export ANTHROPIC_BASE_URL=http://localhost:8317
 export ANTHROPIC_API_KEY=<api-key>
-export ANTHROPIC_MODEL=hy3-preview-agent
+export ANTHROPIC_MODEL=hy4-flash
 claude
 ```
 
@@ -79,7 +79,7 @@ claude
 # curl / OpenAI
 curl http://localhost:8317/v1/chat/completions \
   -H "Authorization: Bearer <api-key>" -H "Content-Type: application/json" \
-  -d '{"model":"hy3-preview-agent","messages":[{"role":"user","content":"你好"}],"stream":true}'
+  -d '{"model":"hy4-flash","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
 流式 / 非流式都支持;非流式请求会被内部转成流式再聚合(CodeBuddy 上游 `code 11101` 拒绝非流式)。
@@ -97,7 +97,7 @@ curl http://localhost:8317/v1/chat/completions \
 
 ## 思考模式
 
-hy3 系列(`hy3` / `hy3-preview` / `hy3-preview-agent`)自动开最大思考:workbuddy 转发前强制 `reasoning_effort=high`,覆盖客户端任何设置。CodeBuddy 只对 `high` 真正开深度思考(`medium` / `max` / `xhigh` 等档位它直接忽略),所以这已是 hy3 能用的最高档。思考内容走 SSE 的 `delta.reasoning_content`,客户端要支持渲染思考块才看得到。
+`hy3` 系列(`hy3` / `hy3-preview` / `hy3-preview-agent`)自动开最大思考:workbuddy 转发前强制 `reasoning_effort=high`,覆盖客户端任何设置。CodeBuddy 只对 `high` 真正开深度思考(`medium` / `max` / `xhigh` 等档位它直接忽略),所以这已是 hy3 能用的最高档。思考内容走 SSE 的 `delta.reasoning_content`,客户端要支持渲染思考块才看得到。`hy4-flash` 不在此列,沿用客户端传入的 `reasoning_effort`。
 
 ## 流式
 
